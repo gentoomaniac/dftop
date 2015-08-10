@@ -1,0 +1,531 @@
+#!/usr/bin/env python
+
+# -*- coding: utf-8 -*-
+
+import os
+import sys
+import getopt
+from operator import attrgetter
+import commands
+import time
+import signal
+import traceback
+from time import strftime, gmtime
+
+try:
+    import curses
+except ImportError, e:
+    NoCurses = 1
+
+'''
+   Data class for file information
+'''
+class fsObject(object):
+    def __init__(self):
+        self.name = ""
+        self.path = ""
+        self.size = 0
+        self.fsPercentage = 0.0
+        self.mtime = 0.0
+        self.readableTime = ""
+    
+    def __repr__(self):
+        return repr((self.name, self.path, self.size))
+
+'''
+   Data class for filesystem information
+'''
+class Filesystem(object):
+    def __init__(self):
+        self.bytesfree = 0
+        self.device = 0
+        self.mountpoint = ""
+        self.size = 0
+        self.stat = None
+        self.type = 0.0
+   
+'''
+   Will be connected to signals e.g. SIG TERM and ensure some cleanup will be done before exiting
+'''
+def signal_handler(signal, frame):
+    # as Dftop implements a singelton, this is safe.
+    dftop = Dftop()
+    dftop.cleanup()
+    sys.exit(0)
+    
+
+'''
+   Main class of dftop
+
+'''
+class Dftop(object):
+
+    '''
+       Dftop should only be created once, so we use a Singeltone
+    '''
+    def __new__(type, *args):
+        # Singelton Part: if there is no instance of the Kernel create one and save it to _the_instance.
+        # If already existing, just return a reference to the instance.
+        if not '_the_instance' in type.__dict__:
+            type._the_instance = object.__new__(type)
+        return type._the_instance
+
+    '''
+       Initialisation
+    '''
+    def __init__(self):
+        if not '_ready' in dir(self):
+            # __init__ will be called on every new call.
+            # Everything which should only be executed while creating the instance has to be put within this block
+            self._ready = True
+
+            self.__C_MOUNTPATH = "/mnt/hardcore"        # path for the temporary mount
+            self.__factor = 1024                        # conversion coefficient for Byte conversion to uman readable output
+            self.__debug = False                        # controlls wether to print debug output
+            self.__verbosity = 1                        # controlls how much debug output will be printed if any
+            
+            self.myFilesystems = None                   # holds an array of filesystem objects
+            self.myFilesystem = None                    # holds a copie of the filesystem object, we are searching in
+            self.myFiles = []                           # holds all the files we found, each in a fsObject instance
+            self.mountPoints = []                       # a list of root dirs we determined as a new mountpoint
+            self.topX = 10                              # print Top x files
+            self.humanreadable = False                  # human readable output
+            self.bindMode = False                       # to avoid performance lags, temporarily mount the identified FS ro in another place
+            self.searchPath = ""                        # the path we are searching in
+            self.originalPath = ""                      # a copy of the original self.searchPath, as the self.searchPath will be modified for bind mounts
+            self.sortMtime = False                      # sort by mtime
+            self.doLoop = False                         # endless loop
+            self.loopInt = 10.0                         # all x seconds
+            self.useCurses = False                      # use curses for output.
+            self.screen = None                          # holds the curses screen
+
+            # connect SIG TERM to our signal handler function
+            signal.signal(signal.SIGINT, signal_handler)
+    
+
+    '''
+       Function for printing debug output. If any output will be printed is controlled by self.__debug.
+       self.__verbosity controlls the verbosity of the output.
+       msg         Text message that will be printed
+       verbose     Verbose level
+    
+       example:
+          debugPrint("Hello Debug!", 2)
+       Will print a Debug message when self.__verbosity is set >= 2
+    '''
+    def debugPrint(self, msg, verbose):
+        if self.__debug and verbose <= self.__verbosity:
+            print >> sys.stderr, "DEBUG >> " + msg
+    
+
+    '''
+       Parses the command line arguments and fills the member variables
+       argv       command line arguments
+    '''
+    def parseParameters(self, argv):
+        # parameter handling
+        try:
+            opts, args = getopt.getopt(argv, "bcd:hkn:tl:", ["help", "bind", "time", "loop=", "debug=", "curses"])
+        except getopt.GetoptError, err:
+            print str(err)
+            self.usage()
+            sys.exit(1)
+        
+        for o, a in opts:
+            if o in ("-h"):
+                self.humanreadable = True
+            elif o in ("-b","--bind"):
+                self.bindMode = True
+            elif o in ("-c","--curses"):
+                self.useCurses = True
+            elif o in ("--help"):
+                self.usage()
+                sys.exit(0)
+            elif o in ("-n"):
+                self.topX = int(a)
+            elif o in ("-d", "--debug"):
+                self.__debug = True
+                self.__verbosity = a
+            elif o in ("-k"):
+                self.__factor = 1000
+            elif o in ("-t", "--time"):
+                self.sortMtime = True
+            elif o in ("-l", "--loop"):
+                self.doLoop = True
+                self.loopInt = float(a)
+            else:
+                assert "bad option"
+    
+        # print error if no path was specified
+        if len(args) < 1:
+            print "You need to specify a path!"
+            sys.exit(2)
+    
+        self.searchPath = os.path.abspath(args[0])
+        self.originalPath = self.searchPath
+
+
+    '''
+       Does some clean up
+       ToDo:
+        - Error handling
+        - OS differentiation
+    '''
+    def cleanup(self):
+        # clean up hardcore changes
+        (stat, output) = commands.getstatusoutput("umount " + self.__C_MOUNTPATH)
+        try:
+            os.rmdir(self.__C_MOUNTPATH)
+        except OSError, err:
+            pass
+
+        if self.useCurses:
+            try:
+                self.screen.keypad(0)
+                curses.echo()
+                curses.nocbreak()
+                curses.endwin()
+            except:
+                pass
+    
+    
+    '''
+       Prints the --help information
+    '''
+    def usage(self):
+        print "Usage:"
+        print "dftop [options] PATH"
+        print ""
+        print "  --bind      -b            does a bind mount before scanning the files. Avoids Scanning of sub mounts"
+        print "  --curses    -c            uses curses interface for output. Prevents scrolling down and clears screen while exiting"
+        print "  --debug #   -d #          enable Debug output. # is an integer and represents the verbosity of the output"
+        print "  --help                    prints this help"
+        print "              -h            human readable output of filesize. K/M/G instead of Byte"
+        print "              -k            use factor 1000 instead of 1024 for human readable output"
+        print "              -n #          print top # files"
+        print "  --time      -t            sort by last modification time (mtime)"
+        print "  --loop #    -l #          repeat every # seconds until SIG TERM recieved"
+    
+    '''
+       return Array of mounted filesystems
+    '''
+    def getMountedFilesystems(self):
+        index = 0
+        filesystems = []
+        self.debugPrint("sys.platform: " + sys.platform, 2)
+    
+        # determine Operating system and depending on which we're on, get FS information
+        if sys.platform == "linux2":
+            self.debugPrint("Linux detected", 2)
+            # try to open /etc/mtab for reading
+            try:
+                fMtab = open("/etc/mtab", "r")
+            except IOError:
+                print "Ooops! couldn't open /etc/mtab!"
+                sys.exit(2)
+    
+            # for each line in /etc/mtab generate a new Filesystem instance
+            for line in fMtab.readlines():
+                # prepare fs object to store more information
+                try:
+                    filesystems.append(Filesystem())
+                    filesystems[index].device = line.split()[0]
+                    filesystems[index].mountpoint = line.split()[1]
+                    filesystems[index].type = line.split()[2]
+                    fsStat = os.statvfs(filesystems[index].mountpoint)
+                    filesystems[index].bytesfree = float(fsStat.f_bavail * fsStat.f_frsize / self.__factor)
+                    filesystems[index].size = float(fsStat.f_blocks * fsStat.f_frsize / self.__factor)
+                    filesystems[index].stat = fsStat
+                except IndexError:
+                    print "Ooops! This shouldn't have happened: Couldn't determine filesystems!"
+                    sys.exit(4)
+                index = index + 1
+            fMtab.close()
+        # AIX part for getting filesystems
+        elif sys.platform == "aix5":
+            self.debugPrint("AIX detected", 2)
+            (stat, output) = commands.getstatusoutput("mount")
+            output = output.split("\n")
+            for line in output:
+                line = line.strip()
+                if not line.startswith("/"):
+                    continue
+                try:
+                    filesystems.append(Filesystem())
+                    filesystems[index].device = line.split()[0]
+                    filesystems[index].mountpoint = line.split()[1]
+                    filesystems[index].type = line.split()[2]
+                    fsStat = os.statvfs(filesystems[index].mountpoint)
+                    filesystems[index].bytesfree = float(fsStat.f_bavail * fsStat.f_frsize / self.__factor)
+                    filesystems[index].size = float(fsStat.f_blocks * fsStat.f_frsize / self.__factor)
+                    filesystems[index].stat = fsStat
+                except IndexError:
+                    print "Ooops! This shouldn't have happened: Couldn't determine filesystems!"
+                    sys.exit(4)
+                index = index + 1
+    
+        # return array of mounted filesystems
+        return filesystems
+    
+    def getFiles(self):
+        # begin crawling around and save data to self.myFiles
+        for root, subDir, files in os.walk(self.searchPath):
+            # identify sub mounts and skip them
+            if os.path.ismount(root) and root.rstrip("/") != self.searchPath:
+                self.mountPoints.append(root)
+                print "Identified " + root + " as mountpoint. Skipping ..."
+                continue
+
+            # skip files in above determined sub mounts; skip errors if no mount points were detected yet
+            try: 
+                if root.startswith(self.mountPoints[len(self.mountPoints) -1 ]):
+                    continue
+            except IndexError:
+                pass
+          
+
+            # loop through files
+            for file in files:
+                fullPath = os.path.join(root, file)
+
+                # skip symlinks
+                try:
+                    if os.path.islink( fullPath ):
+                        continue
+                except OSError:
+                    continue
+
+                # create new fsObject
+                newFsObject = fsObject()
+                # if bind mode, replace the bind mount path with the original self.searchPath; strip // which might appear if we are walking through the root-fs
+                if self.bindMode:
+                    newFsObject.path = root.replace(self.searchPath, self.originalPath).replace("//", "/")
+                else:
+                    newFsObject.path = root
+                newFsObject.name = file
+
+                # if a getsize fails, the item has been deleted, or we do not have permission
+                try:
+                    newFsObject.size = float(os.path.getsize( fullPath ))
+                    stat = os.stat( fullPath )
+                    newFsObject.mtime = stat.st_mtime
+                    newFsObject.readableTime = time.ctime(newFsObject.mtime)
+                except OSError:
+                    print "WARNING: couldn't stat " + fullPath + "! results might be incomplete!"
+                    continue
+                newFsObject.fsPercentage = round(float(newFsObject.size / self.__factor / self.myFilesystem.size * 100), 2)
+                self.myFiles.append(newFsObject)
+
+
+    '''
+       Creates a bind mount of the search path
+    '''
+    def createBindMount(self, srcPath):
+        # create mount point
+        try:
+            os.mkdir(self.__C_MOUNTPATH)
+        except OSError, err:
+            print str(err)
+            sys.exit(3)
+    
+        #Create bind mount
+        # If Linux
+        if sys.platform == "linux2":
+            self.debugPrint("mount " + srcPath + " " + self.__C_MOUNTPATH + " -o bind,ro", 2)
+            (stat, output) = commands.getstatusoutput("mount " + srcPath + " " + self.__C_MOUNTPATH + " -o bind,ro")
+        # case AIX
+        elif sys.platform == "aix5":
+            self.debugPrint("mount -o ro" + srcPath + " " + self.__C_MOUNTPATH, 2)
+            (stat, output) = commands.getstatusoutput("mount -o ro " + srcPath + " " + self.__C_MOUNTPATH)
+    
+    '''
+       Converts a Byte count to a human readable format.
+       Depending on self.__factor, 1000 or 1024 is used for conversion. The unit strings will change accordingly to e.g. MiB instead of M
+       The function works recursively and calls itself, until size < self.__factor:.
+       It will currently FAIL if szye will be larger than 1024 resp. 1000 Terrabyte as Petabytes is not specified!!!
+    
+       size       filesize in Bytes
+       unit=0     Do NOT specify this unless you know what you're doing! This is for recursive use only! It will affect the unit the
+                  function starts with the conversion, e.g. M instead of Bytes!
+    
+       return:
+       size       Float, size as converted value
+       unitstr    String, Unitstring, e.g. M, G or MiB, GiB
+    '''
+    def conv2human(self, size, unit=0):
+        if self.__factor == 1024:
+            units = ['B', 'K', 'M', 'G', 'T' ]
+        elif self.__factor == 1000:
+            units = ['B', 'KiB', 'MiB', 'GiB', 'TiB' ]
+            
+        
+        if size > self.__factor:
+            size, unitstr = self.conv2human( float(size / self.__factor), unit+1 )
+        else:
+            unitstr = units[unit]
+    
+        return size, unitstr
+   
+
+    '''
+       Generates output for the first count files from fileObjects to stdout.
+       Ensures a nice ASCII table ;->
+    
+       fileObjects       sorted array of fsObjects with all file informations
+       count             number of files that shall be printed
+       self.humanreadable     Bool, controlls wehther to print human readable format or not
+
+       return:
+       myOutput          array of strings
+    '''
+    def genOutput(self, fileObjects, count, humanreadble):
+        myOutput = []
+        # initial min size is the header; we're only interested in the first two fields
+        maxlength = [8, 13, 10]
+        if count > len(fileObjects):
+            count = len(fileObjects)
+    
+        # determine max field length of each column
+        for i in range(count):
+            if len(os.path.join(fileObjects[i].path, fileObjects[i].name)) > maxlength[0]:
+                maxlength[0] = len(os.path.join(fileObjects[i].path, fileObjects[i].name))
+            if len(str(fileObjects[i].size)) > maxlength[1]:
+                maxlength[1] = len(str(fileObjects[i].size))
+            if len(str(fileObjects[i].fsPercentage) + "%") > maxlength[2]:
+                maxlength[2] = len(str(fileObjects[i].fsPercentage) + "%")
+    
+        # and add a spacing
+        maxlength[0] = maxlength[0] + 2
+        maxlength[1] = maxlength[1] + 2
+        maxlength[2] = maxlength[2] + 4
+    
+        # print Table header
+        if self.__factor == 1000:
+            myOutput.append("Filename" + " " * (maxlength[0] - 8) + "Filesize" + " " * (maxlength[1] - 4) + "of FS" + " " * (maxlength[2] - 4)+ "Last modified")
+        else:
+            myOutput.append("Filename" + " " * (maxlength[0] - 8) + "Filesize" + " " * (maxlength[1] - 6) + "of FS" + " " * (maxlength[2] - 4)+ "Last modified")
+    
+        # print each file line and fill the fields with blanks until the max width is reached
+        for i in range(count):
+            name = os.path.join(fileObjects[i].path, fileObjects[i].name) + " " * (maxlength[0] - len(os.path.join(fileObjects[i].path, fileObjects[i].name)))
+            if humanreadble:
+                retsize, unitstr = self.conv2human(fileObjects[i].size)
+                retsize = round(retsize, 2)
+                size = str(retsize) + unitstr + " " * (maxlength[1] - len(str(retsize))+1)
+            else:
+                size = str(int(fileObjects[i].size)) + " Byte" + " " * (maxlength[1] - len(str(int(fileObjects[i].size))) - 3)
+            percentage = str(fileObjects[i].fsPercentage) + "%" + " " * (maxlength[2] - len(str(fileObjects[i].fsPercentage)))
+            myOutput.append(name + size + percentage + fileObjects[i].readableTime)
+
+        return myOutput
+   
+    def initCurses(self):
+        try:
+            self.debugPrint("curses init", 3)
+            self.screen = curses.initscr()
+            curses.cbreak()
+            curses.noecho()
+            self.screen.keypad(1)
+        except:
+            print "Ooops! Curses initialisation crashed! Falling pack to stdout ..."
+            if self.screen != None:
+                self.screen.keypad(0)
+                curses.echo()
+                curses.nocbreak()
+                curses.endwin()
+            traceback.print_exc()
+            self.doCurses = False
+
+    def diplayCurses(self, stringlist):
+        try:
+            self.screen.clear()
+#            self.screen.refresh()
+            self.screen.addstr("Last updated: " + strftime("%H:%M:%S", gmtime()) + "\n")
+            for line in stringlist:
+                self.screen.addstr(line + "\n")
+            self.debugPrint(line, 3)
+            self.screen.refresh()
+        except:
+            self.cleanup()
+            traceback.print_exc()
+            sys.exit(7)
+
+    def displayStdout(self, stringlist):
+        for line in stringlist:
+            print line
+    
+    '''
+       Main function.
+       This is where all the fun happens :>
+    '''
+    def run(self, argv):
+        output = []                # stores output lines after generation
+
+        self.parseParameters(argv) 
+    
+
+        # Fetch filesystems
+        self.myFilesystems = self.getMountedFilesystems()
+        # and save mountpoint we are searching in
+        for fs in self.myFilesystems:
+            if self.searchPath.startswith(fs.mountpoint):
+                self.myFilesystem = fs
+            
+    
+        '''
+            create a bind mount if --bind was specified. After bind mounting, all submounts are invisible on the new mountpoint
+            this will prevent the file search to crawl through other FS
+            TODO: make a function from this crap!
+        '''
+        if self.bindMode:
+            self.createBindMount(self.searchPath)
+            self.searchPath = self.__C_MOUNTPATH
+            self.searchPathS = self.__C_MOUNTPATH
+    
+        # check if we are working on a NFS mount and print a warning if we do so
+        if self.myFilesystem.type == "nfs":
+            print "WARNING: currently it is not recommended to use with NFS filesystems as it is REALY slow!"
+        
+        # if to use curses, initialise the window
+        if self.useCurses and self.doLoop:
+            self.initCurses()
+
+        # Loop the output
+        while True:
+    
+            self.getFiles()
+
+            # sort file list
+            if self.sortMtime:
+                self.myFiles = sorted(self.myFiles, key=attrgetter('mtime') , reverse=True)
+            else:
+                self.myFiles = sorted(self.myFiles, key=attrgetter('size') , reverse=True)
+    
+    
+            # generate output
+            output = self.genOutput(self.myFiles, self.topX, self.humanreadable)
+
+            # if use curses, display via curses
+            if self.useCurses and self.doLoop and not NoCurses:
+                self.diplayCurses(output)
+            else:
+                self.displayStdout(output)
+
+
+            # if self.doLoop, then wait and repeat
+            if self.doLoop and not NoCurses:
+                del self.myFiles[:]
+                time.sleep(self.loopInt)
+                if not self.useCurses:
+                    print"\n\n"
+            # else exit
+            else:
+                break
+    
+        self.cleanup()
+
+
+
+if __name__ == "__main__":
+    dftop = Dftop()
+    dftop.run(sys.argv[1:])
